@@ -48,13 +48,17 @@ for now.
 
 Linux (x86_64, aarch64) and macOS (x86_64, aarch64) are the primary
 targets and run in CI. **FreeBSD** (x86_64) builds and runs natively —
-install `gmake` + `perl5` for the vendored OpenSSL/libcurl C build, then
-the usual `cargo install`. A `freebsd` CI job builds + tests the binary
-inside a native FreeBSD VM (the vendored OpenSSL C sources don't
-cross-compile from Linux, so BSD is built natively rather than
-cross-targeted). NetBSD / OpenBSD aren't tested but the code is
-`std`-and-`libc`-only with no Linux-specific syscalls, so they're
-expected to work with the same build prerequisites.
+`pkg install gmake perl5 ca_root_nss` for the vendored OpenSSL/libcurl C
+build (`gmake` because OpenSSL needs GNU make; `ca_root_nss` *before*
+building so libcurl bakes in a CA-bundle path — otherwise real API
+calls fail TLS verification, fixable at runtime with
+`SSL_CERT_FILE=/etc/ssl/cert.pem`), then the usual `cargo install`. A
+`freebsd` CI job builds + tests the binary inside a native FreeBSD VM
+(the vendored OpenSSL C sources don't cross-compile from Linux, so BSD
+is built natively rather than cross-targeted). NetBSD / OpenBSD aren't
+tested but the code is `std`-and-`libc`-only with no Linux-specific
+syscalls, so they're expected to work with the same build
+prerequisites.
 
 ## Status
 

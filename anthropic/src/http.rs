@@ -363,6 +363,107 @@ unsafe fn curl_global_init_once() {
     });
 }
 
+/// What `probe_tls` observed for one `host:port`. Either:
+///   - both `tcp` and `tls` Durations populated (success), or
+///   - `tcp` populated and `tls` is None + `error` set (TCP ok, TLS failed —
+///     the canonical FreeBSD-without-`ca_root_nss` signature), or
+///   - both None + `error` set (the TCP connect itself failed).
+#[derive(Debug, Clone)]
+pub struct TlsProbe {
+    /// Wall-clock duration of the TCP connect, if it succeeded.
+    pub tcp: Option<std::time::Duration>,
+    /// Wall-clock duration of the full TCP+TLS handshake, if it succeeded.
+    pub tls: Option<std::time::Duration>,
+    /// libcurl error string if any stage failed.
+    pub error: Option<String>,
+}
+
+/// Probe `host:port` with a TCP connect followed by a TLS handshake.
+///
+/// Two-stage measurement:
+///   1. `http://host:port/` with `CURLOPT_CONNECT_ONLY=1` — pure TCP, no
+///      TLS (libcurl never starts a handshake on a plain-http URL). Times
+///      the network path independent of TLS.
+///   2. `https://host:port/` with `CURLOPT_CONNECT_ONLY=1` — for an
+///      https-scheme URL the "connection setup" libcurl performs **includes
+///      the TLS handshake**, then it stops before any HTTP request is sent.
+///      No entry lands in the provider's request log.
+///
+/// Splitting the two cleanly distinguishes a CA-bundle / cert failure
+/// (stage 1 ok, stage 2 fails) from a DNS / firewall / proxy failure
+/// (stage 1 fails). The doctor uses this to give the FreeBSD-specific
+/// `pkg install ca_root_nss` hint only when the failure is genuinely a TLS
+/// trust problem.
+pub fn probe_tls(host: &str, port: u16, timeout: std::time::Duration) -> TlsProbe {
+    use std::time::Instant;
+    let tcp_url = match CString::new(format!("http://{host}:{port}/")) {
+        Ok(s) => s,
+        Err(_) => {
+            return TlsProbe { tcp: None, tls: None, error: Some("invalid host".to_string()) };
+        }
+    };
+    let tls_url = match CString::new(format!("https://{host}:{port}/")) {
+        Ok(s) => s,
+        Err(_) => {
+            return TlsProbe { tcp: None, tls: None, error: Some("invalid host".to_string()) };
+        }
+    };
+    let tmo_ms = timeout.as_millis().min(i64::MAX as u128) as i64;
+
+    let stage = |url: &CString| -> Result<std::time::Duration, String> {
+        unsafe {
+            curl_global_init_once();
+            let easy = c::curl_easy_init();
+            if easy.is_null() {
+                return Err("curl_easy_init failed".to_string());
+            }
+            // Best-effort setopt: any failure here is reported as an opaque
+            // string and we still clean up the handle below before returning.
+            let setopt = |opt: c::CURLoption, val: i64| -> Result<(), String> {
+                let rc = c::curl_easy_setopt(easy, opt, val);
+                if rc != c::CURLE_OK { Err(format!("setopt {opt}: rc={rc}")) } else { Ok(()) }
+            };
+            let setopt_ptr_val = |opt: c::CURLoption, val: *const c_void| -> Result<(), String> {
+                let rc = c::curl_easy_setopt(easy, opt, val);
+                if rc != c::CURLE_OK { Err(format!("setopt {opt}: rc={rc}")) } else { Ok(()) }
+            };
+            let setup = || -> Result<(), String> {
+                setopt_ptr_val(c::CURLOPT_URL, url.as_ptr() as *const c_void)?;
+                setopt(c::CURLOPT_CONNECT_ONLY, 1)?;
+                setopt(c::CURLOPT_CONNECTTIMEOUT_MS, tmo_ms)?;
+                setopt(c::CURLOPT_TIMEOUT_MS, tmo_ms)?;
+                setopt(c::CURLOPT_NOSIGNAL, 1)?;
+                Ok(())
+            };
+            let res = setup();
+            let start = Instant::now();
+            let perform_rc = if res.is_ok() { c::curl_easy_perform(easy) } else { c::CURLE_OK };
+            let elapsed = start.elapsed();
+            c::curl_easy_cleanup(easy);
+            // cleanup is done; safe to propagate the setup error.
+            res?;
+            if perform_rc != c::CURLE_OK {
+                let p = c::curl_easy_strerror(perform_rc);
+                let msg = if p.is_null() {
+                    format!("curl code {perform_rc}")
+                } else {
+                    std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+                };
+                return Err(msg);
+            }
+            Ok(elapsed)
+        }
+    };
+
+    match stage(&tcp_url) {
+        Err(e) => TlsProbe { tcp: None, tls: None, error: Some(format!("tcp: {e}")) },
+        Ok(tcp) => match stage(&tls_url) {
+            Ok(tls) => TlsProbe { tcp: Some(tcp), tls: Some(tls), error: None },
+            Err(e) => TlsProbe { tcp: Some(tcp), tls: None, error: Some(format!("tls: {e}")) },
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

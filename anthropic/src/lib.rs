@@ -10,6 +10,8 @@ mod http;
 pub mod json;
 mod parse;
 
+pub use http::{TlsProbe, probe_tls};
+
 use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
 

@@ -4,13 +4,19 @@ Get from `git clone` to a running agent in about five minutes.
 
 ## Prereqs
 
-- Rust ≥ 1.85 (`rustup toolchain install stable`)
+- Rust ≥ 1.85 (edition 2024). `rustup toolchain install stable`, or on
+  FreeBSD `pkg install rust` (must be ≥ 1.85) — though `rustup` is
+  preferred since it honours this repo's `rust-toolchain.toml` pin.
 - A C toolchain for `curl-sys`'s static-OpenSSL build:
   - **Debian / Ubuntu:** `sudo apt install build-essential pkg-config perl`
   - **macOS:** `xcode-select --install`
   - **Fedora / RHEL:** `sudo dnf install gcc gcc-c++ make perl pkgconfig`
-  - **FreeBSD:** `pkg install gmake perl5` (and `git` if you use the
-    branch-strategy tools). OpenSSL's build needs GNU make, hence `gmake`.
+  - **FreeBSD:** `pkg install gmake perl5 ca_root_nss git`. OpenSSL's
+    build needs GNU make, hence `gmake`. Install `ca_root_nss`
+    **before** building: libcurl bakes a CA-bundle path in at build
+    time, so a real `agent run` fails TLS verification if no CA store
+    was present when you compiled (see Troubleshooting). `git` is only
+    needed for the branch-strategy tools.
 - An API key for either Anthropic or any OpenAI-compatible provider.
 
 If you'd rather not install Rust, see the Docker path in the
@@ -203,6 +209,15 @@ failure. Check `/etc/resolv.conf`; behind a corporate proxy, set
 `HTTPS_PROXY`. Note: the static-curl build does NOT consult `curl`'s
 runtime CA bundle; the bundled CA store from the openssl-src build is
 used.
+
+**`curl error 60: SSL certificate problem` (often on FreeBSD)** — the
+statically-linked libcurl/OpenSSL couldn't find a CA bundle. The CA
+path is detected at *build* time, so the durable fix is `pkg install
+ca_root_nss` **before** `cargo install`. If the binary is already
+built, point OpenSSL at the system store at runtime instead:
+`export SSL_CERT_FILE=/etc/ssl/cert.pem` (FreeBSD; the path
+`ca_root_nss` populates). `--mock` runs make no network calls, so this
+only surfaces on a real prompt.
 
 **`session store append failed: …`** — Check that `--sessions DIR`
 points at a writable path. Errors are best-effort logged; the prompt

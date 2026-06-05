@@ -28,11 +28,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build + test in a FreeBSD VM
         uses: vmactions/freebsd-vm@v1
         with:
-          release: "14.2"
+          # No `release:` pin — vmactions sometimes lags the FreeBSD
+          # release cadence (image bucket doesn't include the most recent
+          # point release). Letting the action pick its own default avoids
+          # SSH-into-VM failures (exit 101) on images it doesn't actually
+          # ship. If we ever need to pin, check
+          # https://github.com/vmactions/freebsd-vm for the current list
+          # of supported releases.
           usesh: true
           # Native toolchain for the vendored C deps:
           #   gmake  — OpenSSL's generated Makefile needs GNU make.

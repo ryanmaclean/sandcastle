@@ -7,10 +7,11 @@
 //!   2 — a key is set but the network probe failed
 
 use std::io::Write;
-use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use anthropic::TlsProbe;
 
 /// Snapshot of the env we inspect. Constructed once in `doctor_cmd` and
 /// threaded through so `run_doctor` is unit-testable without `std::env`
@@ -90,7 +91,7 @@ pub fn doctor_cmd(args: Vec<String>) -> ExitCode {
 
     let mut env = DoctorEnv::from_env();
     env.metrics_flag = metrics_flag;
-    let outcome = run_doctor(&env, &mcp_specs, &mut std::io::stdout(), probe_host);
+    let outcome = run_doctor(&env, &mcp_specs, &mut std::io::stdout(), anthropic::probe_tls);
     outcome.exit_code()
 }
 
@@ -99,9 +100,11 @@ fn print_help() {
         usage:\n  \
         agent doctor [--mcp 'CMD ARGS' ...]\n\n\
         Reports the binary version, env vars the agent reads, whether the\n\
-        relevant provider host accepts a TCP connection, and (with --mcp)\n\
-        whether each MCP server spawns + handshakes cleanly.\n\n\
-        Exit:  0 ok  |  1 no provider key set  |  2 key set but host unreachable";
+        relevant provider host completes a TCP connect + TLS handshake (no\n\
+        HTTP request is sent, so the probe leaves no entry in the provider's\n\
+        request log), and (with --mcp) whether each MCP server spawns +\n\
+        handshakes cleanly.\n\n\
+        Exit:  0 ok  |  1 no provider key set  |  2 key set but host unreachable / TLS failed";
     eprintln!("{m}");
 }
 
@@ -111,7 +114,7 @@ pub(crate) fn run_doctor<W: Write>(
     env: &DoctorEnv,
     mcp_specs: &[String],
     out: &mut W,
-    probe: fn(&str, u16, Duration) -> Result<Duration, String>,
+    probe: fn(&str, u16, Duration) -> TlsProbe,
 ) -> DoctorOutcome {
     let _ = writeln!(out, "agent doctor");
     let _ = writeln!(out, "─────────────");
@@ -208,19 +211,58 @@ fn write_probe_line<W: Write>(
     out: &mut W,
     host: &str,
     port: u16,
-    probe: fn(&str, u16, Duration) -> Result<Duration, String>,
+    probe: fn(&str, u16, Duration) -> TlsProbe,
     any_ok: &mut bool,
     any_fail: &mut bool,
 ) {
-    match probe(host, port, Duration::from_secs(5)) {
-        Ok(d) => {
+    let r = probe(host, port, Duration::from_secs(5));
+    match (r.tcp, r.tls, r.error.as_deref()) {
+        // TCP + TLS both succeeded.
+        (Some(tcp), Some(tls), _) => {
             *any_ok = true;
-            let _ =
-                writeln!(out, "  {host}:{port:<5}   reachable ({}ms)         [ok]", d.as_millis());
+            let _ = writeln!(
+                out,
+                "  {host}:{port:<5}   TCP {}ms / TLS {}ms        [ok]",
+                tcp.as_millis(),
+                tls.as_millis()
+            );
         }
-        Err(e) => {
+        // TCP ok, TLS failed — the FreeBSD-without-ca_root_nss signature.
+        // Surface a targeted hint when the error looks cert-related.
+        (Some(tcp), None, Some(err)) => {
             *any_fail = true;
-            let _ = writeln!(out, "  {host}:{port:<5}   FAILED ({e})    [--]");
+            let _ = writeln!(
+                out,
+                "  {host}:{port:<5}   TCP {}ms / TLS FAILED ({err})    [--]",
+                tcp.as_millis()
+            );
+            let lower = err.to_ascii_lowercase();
+            if lower.contains("certificate")
+                || lower.contains("ca cert")
+                || lower.contains("ssl peer certificate")
+                || lower.contains("ssl_cert")
+                || lower.contains("self-signed")
+                || lower.contains("self signed")
+            {
+                let _ = writeln!(
+                    out,
+                    "    hint: CA bundle not found. On FreeBSD: `pkg install \
+                     ca_root_nss` (then rebuild), or at runtime set \
+                     SSL_CERT_FILE=/etc/ssl/cert.pem."
+                );
+            }
+        }
+        // TCP itself failed (DNS / connect / firewall / proxy).
+        (None, _, Some(err)) => {
+            *any_fail = true;
+            let _ = writeln!(out, "  {host}:{port:<5}   FAILED ({err})    [--]");
+        }
+        // Defensive: probe returned partial data with no error. Unreachable
+        // by construction (probe_tls always populates `error` when either
+        // duration is missing), but kept so the match is exhaustive.
+        (_, _, None) => {
+            *any_fail = true;
+            let _ = writeln!(out, "  {host}:{port:<5}   FAILED (no result)    [--]");
         }
     }
 }
@@ -302,20 +344,10 @@ fn extract_host(base_url: Option<&str>, default: &str) -> String {
     without_path.split(':').next().unwrap_or(without_path).to_string()
 }
 
-/// Open a TCP connection to `host:port` with a timeout. Returns the
-/// observed connect duration on success. We deliberately do NOT speak
-/// HTTP — the goal is "does the network path resolve and answer?" and a
-/// real request would show up in the provider's audit log.
-fn probe_host(host: &str, port: u16, timeout: Duration) -> Result<Duration, String> {
-    let addr = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| format!("resolve: {e}"))?
-        .next()
-        .ok_or_else(|| "no address".to_string())?;
-    let start = Instant::now();
-    TcpStream::connect_timeout(&addr, timeout).map_err(|e| format!("connect: {e}"))?;
-    Ok(start.elapsed())
-}
+// The real network probe is `anthropic::probe_tls`: TCP connect + TLS
+// handshake via libcurl CONNECT_ONLY=2, no HTTP request sent. The doctor
+// keeps a function-pointer hole (`probe: fn(...) -> TlsProbe`) so unit
+// tests can drive `run_doctor` synchronously without a network.
 
 #[cfg(test)]
 mod tests {
@@ -346,7 +378,7 @@ mod tests {
             dogstatsd_addr: None,
             metrics_flag: None,
         };
-        fn never(_: &str, _: u16, _: Duration) -> Result<Duration, String> {
+        fn never(_: &str, _: u16, _: Duration) -> TlsProbe {
             unreachable!("probe should not be called when no key set")
         }
         let mut out = Vec::new();
@@ -367,11 +399,17 @@ mod tests {
             dogstatsd_addr: None,
             metrics_flag: None,
         };
-        fn ok(_: &str, _: u16, _: Duration) -> Result<Duration, String> {
-            Ok(Duration::from_millis(42))
+        fn ok(_: &str, _: u16, _: Duration) -> TlsProbe {
+            TlsProbe {
+                tcp: Some(Duration::from_millis(20)),
+                tls: Some(Duration::from_millis(80)),
+                error: None,
+            }
         }
         let mut out = Vec::new();
         assert_eq!(run_doctor(&env, &[], &mut out, ok), DoctorOutcome::Ok);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("TCP 20ms / TLS 80ms"), "expected TCP/TLS line, got: {s}");
     }
 
     #[test]
@@ -387,11 +425,43 @@ mod tests {
             dogstatsd_addr: None,
             metrics_flag: None,
         };
-        fn err(_: &str, _: u16, _: Duration) -> Result<Duration, String> {
-            Err("connect: timed out".to_string())
+        fn err(_: &str, _: u16, _: Duration) -> TlsProbe {
+            TlsProbe { tcp: None, tls: None, error: Some("tcp: timed out".into()) }
         }
         let mut out = Vec::new();
         assert_eq!(run_doctor(&env, &[], &mut out, err), DoctorOutcome::ProbeFailed);
+    }
+
+    /// FreeBSD-without-ca_root_nss signature: TCP connects fine, TLS
+    /// handshake fails on cert verification. The doctor must surface the
+    /// targeted CA-bundle hint so the user fixes the right thing.
+    #[test]
+    fn tls_cert_failure_prints_freebsd_ca_hint() {
+        let env = DoctorEnv {
+            anthropic_key: Some("sk-ant-abcd1234".into()),
+            openai_key: None,
+            openai_base_url: None,
+            model: None,
+            agents_root: None,
+            sessions_dir: None,
+            runlog_dir: None,
+            dogstatsd_addr: None,
+            metrics_flag: None,
+        };
+        fn cert_err(_: &str, _: u16, _: Duration) -> TlsProbe {
+            TlsProbe {
+                tcp: Some(Duration::from_millis(15)),
+                tls: None,
+                error: Some("tls: SSL peer certificate or SSH remote key was not OK".into()),
+            }
+        }
+        let mut out = Vec::new();
+        assert_eq!(run_doctor(&env, &[], &mut out, cert_err), DoctorOutcome::ProbeFailed);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("TCP 15ms"), "expected TCP duration, got: {s}");
+        assert!(s.contains("TLS FAILED"), "expected TLS-failed marker, got: {s}");
+        assert!(s.contains("ca_root_nss"), "expected FreeBSD CA hint, got: {s}");
+        assert!(s.contains("SSL_CERT_FILE"), "expected runtime hint, got: {s}");
     }
 
     #[test]
