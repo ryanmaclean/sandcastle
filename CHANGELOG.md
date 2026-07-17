@@ -15,6 +15,9 @@ semver pre-1.0 (every release is `0.x.y`; minor bumps may break API).
 ### Changed
 - Metrics now emitted across `agent run`, `agent serve`, and subagents (subagents inherit the parent's emitter); opt-in via `--metrics`/`DOGSTATSD_ADDR`, no-op when unset.
 
+### Security
+- JSON parser (`anthropic`, `openai`): nesting depth is now capped at 128 (`MAX_DEPTH`). A single untrusted SSE/NDJSON frame of deeply nested `[`/`{` within the 4 MiB frame cap could previously recurse until the stack overflowed and the process aborted — an uncatchable DoS reachable from the model API, any OpenAI-compatible endpoint, or an MCP peer. Over-deep input now returns a clean `InvalidResponse` error. Regression tests cover both crates.
+
 ### Removed (round 7 — staff-eng cut pass)
 - `cluster` crate: distributed actor refs with no callers.
 - `gitea`, `github`: forge clients with no callers; forge ops belong behind MCP.

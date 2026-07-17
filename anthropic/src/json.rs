@@ -6,8 +6,9 @@
 //!   - `Json` + `parse`: a value tree with by-key lookup. Numbers are kept
 //!     as their source bytes — we only need string/bool/null discrimination.
 //!
-//! The Messages API responses we parse are small (one SSE frame) and bounded
-//! in depth, so a recursive descent is fine.
+//! The Messages API responses we parse are small (one SSE frame); recursive
+//! descent is fine because `MAX_DEPTH` caps nesting, so a hostile or
+//! malformed frame errors cleanly instead of overflowing the stack.
 
 use crate::Error;
 
@@ -56,10 +57,19 @@ impl Json {
     }
 }
 
+/// Max nesting depth for `[`/`{`. Recursive descent turns each level of
+/// nesting into a stack frame, so an unbounded depth lets a single frame
+/// (up to the 4 MiB `SseFramer` cap) of `[[[[…` overflow the stack and
+/// abort the process — an uncatchable DoS reachable from any untrusted
+/// JSON source (model API, OpenAI-compatible endpoint, MCP peer). The
+/// Messages API nests only a handful deep; 128 is far above real payloads
+/// and far below the frame budget that would overflow.
+const MAX_DEPTH: usize = 128;
+
 pub fn parse(input: &[u8]) -> Result<Json, Error> {
     let mut p = Parser { bytes: input, pos: 0 };
     p.skip_ws();
-    let v = p.value()?;
+    let v = p.value(0)?;
     p.skip_ws();
     if p.pos != p.bytes.len() {
         return Err(Error::InvalidResponse(format!("trailing bytes at {}", p.pos)));
@@ -112,11 +122,17 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn value(&mut self) -> Result<Json, Error> {
+    fn value(&mut self, depth: usize) -> Result<Json, Error> {
+        if depth > MAX_DEPTH {
+            return Err(Error::InvalidResponse(format!(
+                "nesting exceeds max depth {MAX_DEPTH} at {}",
+                self.pos
+            )));
+        }
         self.skip_ws();
         match self.peek() {
-            Some(b'{') => self.object(),
-            Some(b'[') => self.array(),
+            Some(b'{') => self.object(depth),
+            Some(b'[') => self.array(depth),
             Some(b'"') => self.string().map(Json::Str),
             Some(b't') => {
                 self.keyword(b"true")?;
@@ -135,7 +151,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn object(&mut self) -> Result<Json, Error> {
+    fn object(&mut self, depth: usize) -> Result<Json, Error> {
         self.expect(b'{')?;
         let mut out = Vec::new();
         self.skip_ws();
@@ -148,7 +164,7 @@ impl<'a> Parser<'a> {
             let key = self.string()?;
             self.skip_ws();
             self.expect(b':')?;
-            let v = self.value()?;
+            let v = self.value(depth + 1)?;
             out.push((key, v));
             self.skip_ws();
             match self.bump() {
@@ -164,7 +180,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn array(&mut self) -> Result<Json, Error> {
+    fn array(&mut self, depth: usize) -> Result<Json, Error> {
         self.expect(b'[')?;
         let mut out = Vec::new();
         self.skip_ws();
@@ -173,7 +189,7 @@ impl<'a> Parser<'a> {
             return Ok(Json::Arr(out));
         }
         loop {
-            let v = self.value()?;
+            let v = self.value(depth + 1)?;
             out.push(v);
             self.skip_ws();
             match self.bump() {
@@ -386,5 +402,30 @@ mod tests {
     #[test]
     fn parse_rejects_unterminated_string() {
         assert!(parse(br#""hello"#).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_deeply_nested_without_overflow() {
+        // A single frame of ~200k `[` used to overflow the stack and abort
+        // the process (uncatchable DoS). It must now be a clean error.
+        let deep = vec![b'['; 200_000];
+        assert!(parse(&deep).is_err());
+        // Objects too.
+        let mut obj = Vec::new();
+        for _ in 0..200_000 {
+            obj.extend_from_slice(br#"{"a":"#);
+        }
+        assert!(parse(&obj).is_err());
+    }
+
+    #[test]
+    fn parse_allows_nesting_up_to_the_cap() {
+        // Real payloads nest only a handful deep; a modest depth still parses.
+        let depth = 64;
+        let mut s = Vec::new();
+        s.extend(std::iter::repeat_n(b'[', depth));
+        s.push(b'0');
+        s.extend(std::iter::repeat_n(b']', depth));
+        assert!(parse(&s).is_ok());
     }
 }

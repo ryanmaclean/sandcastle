@@ -97,7 +97,14 @@ on every execution path.
 
 ## High
 
-### H1 — Unbounded recursion in the hand-rolled JSON parser → process abort (DoS)
+### H1 — Unbounded recursion in the hand-rolled JSON parser → process abort (DoS)  ✅ FIXED
+
+> **Status: fixed on this branch.** A `MAX_DEPTH = 128` cap is now threaded
+> through `value()`/`object()`/`array()` in both `anthropic/src/json.rs` and
+> `openai/src/json.rs`; over-deep input returns `Error::InvalidResponse`
+> instead of overflowing. Regression tests (`parse_rejects_deeply_nested_without_overflow`,
+> `parse_allows_nesting_up_to_the_cap`) added to both crates.
+
 
 `anthropic/src/json.rs` (and identical `openai/src/json.rs`):
 `value()`→`object()`/`array()`→`value()` has **no depth limit**. A single
@@ -253,8 +260,8 @@ parts of the package's safety story:
    ADRs): the sandbox does not confine and the audit scanner is telemetry,
    not a boundary. This is the cheapest, highest-value fix — it stops
    users from trusting a boundary that isn't there.
-2. **H1 — add JSON recursion depth caps** (small, self-contained, removes
-   a remote process-kill). Good first code change.
+2. ~~**H1 — add JSON recursion depth caps**~~ ✅ **done** (depth cap 128 +
+   regression tests in both parsers).
 3. **H2 — bind `serve` to loopback + require a token.**
 4. **C1/C2/H3/H4 — decide the real isolation story**: a genuine OS
    sandbox + allowlist if untrusted models are in scope, or an explicit
