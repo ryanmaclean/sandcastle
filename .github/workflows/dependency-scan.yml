@@ -1,0 +1,185 @@
+name: dependency-scan
+
+# Advisory scanning for both the Rust dependency graph *and* the C
+# libraries this workspace statically vendors (see SECURITY-AUDIT.md H5).
+#
+# `cargo audit` / RUSTSEC only see the Rust wrapper crates (curl-sys,
+# openssl-src, libz-sys) — never the bundled C source. So a C-level CVE
+# in libcurl / OpenSSL / zlib is invisible to the normal Rust toolchain.
+# CI runners have network (unlike the offline `--frozen` build), so this
+# workflow reaches the live OSV database:
+#
+#   * rust-crates : osv-scanner over the workspace Cargo.lock. Fails the
+#                   build on any advisory against a vendored Rust crate.
+#   * c-libraries : extracts the pinned libcurl/OpenSSL/zlib versions from
+#                   the vendored C source and queries the public OSV API.
+#                   Informational only (never fails the build) — the
+#                   versions and any advisory hits land in the job summary.
+#
+# The weekly cron matters: it re-checks the *already-pinned* versions so a
+# newly-published advisory against a version we still ship is caught even
+# when no code changed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Monday 07:00 UTC — offset from cross-check.yml's 06:00 slot.
+    - cron: '0 7 * * 1'
+
+jobs:
+  # ------------------------------------------------------------------
+  # Rust crates: authoritative scan of the workspace lockfile. May fail
+  # the build. Uses the official reusable workflow, pinned to a tag.
+  # `--lockfile=./Cargo.lock` targets the workspace lock only, so the
+  # per-crate lockfiles under vendor/ don't add false positives.
+  # ------------------------------------------------------------------
+  rust-crates:
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.2.2
+    with:
+      scan-args: |-
+        --lockfile=./Cargo.lock
+      fail-on-vuln: true
+      # Repo may not have GitHub Advanced Security; skip the SARIF upload
+      # to code-scanning. Findings still fail the job and are printed in
+      # the run log + uploaded as a SARIF artifact.
+      upload-sarif: false
+
+  # ------------------------------------------------------------------
+  # Bundled C libraries: NOT in Cargo.lock, so osv-scanner above can't
+  # see them. Extract each pinned version from the vendored source and
+  # ask the OSV API about it. Best-effort / informational: a transient
+  # OSV hiccup must not fail the build, but the versions and any hits
+  # are always surfaced in the Step Summary and run log.
+  # ------------------------------------------------------------------
+  c-libraries:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract bundled C-library versions
+        id: versions
+        run: |
+          set -euo pipefail
+
+          CURLVER_H="vendor/curl-sys/curl/include/curl/curlver.h"
+          OSSL_DAT="vendor/openssl-src/openssl/VERSION.dat"
+          ZLIB_H="vendor/libz-sys/src/zlib/zlib.h"
+
+          # libcurl: LIBCURL_VERSION string, e.g. "8.20.0-DEV".
+          # Strip any -DEV / pre-release suffix for the OSV version query,
+          # but keep the raw string for display.
+          CURL_RAW=$(grep -E '#define[[:space:]]+LIBCURL_VERSION[[:space:]]+"' "$CURLVER_H" \
+                       | head -1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
+          CURL_RAW=${CURL_RAW:-unknown}
+          CURL_VER=${CURL_RAW%%-*}
+
+          # OpenSSL: MAJOR/MINOR/PATCH lines in VERSION.dat -> e.g. 3.6.2
+          OSSL_MAJOR=$(grep -E '^MAJOR=' "$OSSL_DAT" | head -1 | cut -d= -f2 || true)
+          OSSL_MINOR=$(grep -E '^MINOR=' "$OSSL_DAT" | head -1 | cut -d= -f2 || true)
+          OSSL_PATCH=$(grep -E '^PATCH=' "$OSSL_DAT" | head -1 | cut -d= -f2 || true)
+          OSSL_VER="${OSSL_MAJOR:-?}.${OSSL_MINOR:-?}.${OSSL_PATCH:-?}"
+
+          # zlib: ZLIB_VERSION in the stock-zlib header, e.g. "1.3.2".
+          # (The alternate zlib-ng header under src/zlib-ng/ is only built
+          # when the zlib-ng feature is enabled; the stock path is what
+          # this workspace ships.)
+          ZLIB_VER=$(grep -E '#define[[:space:]]+ZLIB_VERSION[[:space:]]+"' "$ZLIB_H" \
+                       | head -1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
+          ZLIB_VER=${ZLIB_VER:-unknown}
+
+          echo "libcurl (raw)   = $CURL_RAW"
+          echo "libcurl (query) = $CURL_VER"
+          echo "openssl         = $OSSL_VER"
+          echo "zlib            = $ZLIB_VER"
+
+          {
+            echo "curl_raw=$CURL_RAW"
+            echo "curl_ver=$CURL_VER"
+            echo "openssl_ver=$OSSL_VER"
+            echo "zlib_ver=$ZLIB_VER"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Query OSV for bundled C-library advisories
+        env:
+          CURL_RAW: ${{ steps.versions.outputs.curl_raw }}
+          CURL_VER: ${{ steps.versions.outputs.curl_ver }}
+          OSSL_VER: ${{ steps.versions.outputs.openssl_ver }}
+          ZLIB_VER: ${{ steps.versions.outputs.zlib_ver }}
+        run: |
+          set -euo pipefail
+
+          # Query the public OSV API for a package/version. Best-effort:
+          # a network/parse failure yields QUERY_ERROR, never a hard fail.
+          # C libraries are queried via the ecosystem-less generic purl
+          # (pkg:generic/<name>); OSV serves OSS-Fuzz + advisory records
+          # that carry a proper version range through this shape.
+          query_osv() {
+            local name="$1" ver="$2" resp ids
+            local body
+            body=$(printf '{"package":{"purl":"pkg:generic/%s"},"version":"%s"}' "$name" "$ver")
+            resp=$(curl -sS --max-time 30 \
+                     -H 'Content-Type: application/json' \
+                     -X POST -d "$body" \
+                     https://api.osv.dev/v1/query 2>/dev/null || echo '__ERR__')
+            if [ "$resp" = '__ERR__' ] || [ -z "$resp" ]; then
+              echo "QUERY_ERROR"
+              return 0
+            fi
+            ids=$(printf '%s' "$resp" \
+                    | jq -r '(.vulns // []) | map(.id) | join(", ")' 2>/dev/null || echo '__ERR__')
+            if [ "$ids" = '__ERR__' ]; then
+              echo "QUERY_ERROR"
+            elif [ -z "$ids" ]; then
+              echo "none"
+            else
+              echo "$ids"
+            fi
+          }
+
+          CURL_HITS=$(query_osv curl    "$CURL_VER" || true)
+          OSSL_HITS=$(query_osv openssl "$OSSL_VER" || true)
+          ZLIB_HITS=$(query_osv zlib    "$ZLIB_VER" || true)
+
+          # Echo to the run log so the result is visible even without the
+          # summary tab.
+          echo "curl    $CURL_VER -> $CURL_HITS"
+          echo "openssl $OSSL_VER -> $OSSL_HITS"
+          echo "zlib    $ZLIB_VER -> $ZLIB_HITS"
+
+          # ...and into the GitHub Step Summary.
+          {
+            echo "## Bundled C-library advisory scan"
+            echo ""
+            echo "Static-linked C deps are **not** in \`Cargo.lock\`, so the"
+            echo "\`rust-crates\` osv-scanner job cannot see them. Versions below"
+            echo "are extracted from the vendored source and checked against the"
+            echo "live OSV database. This check is **informational** and never"
+            echo "fails the build."
+            echo ""
+            echo "| Library | Bundled version | OSV advisories |"
+            echo "|---|---|---|"
+            echo "| libcurl | \`$CURL_RAW\` (queried as \`$CURL_VER\`) | $CURL_HITS |"
+            echo "| OpenSSL | \`$OSSL_VER\` | $OSSL_HITS |"
+            echo "| zlib | \`$ZLIB_VER\` | $ZLIB_HITS |"
+            echo ""
+            echo "> \`none\` = no advisory matched this pinned version via the"
+            echo "> \`pkg:generic/<name>\` version query. \`QUERY_ERROR\` = the OSV"
+            echo "> API call failed (transient); re-run to retry."
+            echo ">"
+            echo "> **Caveat:** OSV frequently records C-library CVEs as \`GIT\`"
+            echo "> commit ranges with an *empty* package field (e.g."
+            echo "> CVE-2023-38545 for curl), which a name+version query cannot"
+            echo "> match. Treat \`none\` as \"nothing flagged by the version query\","
+            echo "> not a guarantee of zero CVEs. For a pinned bump, cross-check"
+            echo "> the upstream security feeds (curl.se/docs/security.html,"
+            echo "> openssl.org/news/vulnerabilities.html, zlib.net) manually."
+          } >> "$GITHUB_STEP_SUMMARY"

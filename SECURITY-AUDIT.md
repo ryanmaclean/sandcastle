@@ -117,7 +117,14 @@ MCP peer (which routes NDJSON through `anthropic::json::parse`).
 **Fix:** add an explicit depth counter (e.g. reject > 128) to `value()`
 in both crates, returning `Error::InvalidResponse`.
 
-### H2 — `agent serve` is an unauthenticated, shell-capable endpoint on `0.0.0.0`
+### H2 — `agent serve` is an unauthenticated, shell-capable endpoint on `0.0.0.0`  ✅ FIXED
+
+> **Status: fixed on this branch.** Default bind moved to `127.0.0.1:3583`;
+> `--token`/`AGENT_API_TOKEN` gates `POST /agents/*` with a constant-time
+> bearer check (401 otherwise); `serve` refuses to start on a non-loopback
+> bind with no token. `/healthz`,`/readyz` stay open. Tests added.
+> Remaining review item: this is a behavior change (default bind + refusal).
+
 
 `POST /agents/chat/<id>` performs **no authentication** — the server
 parses only `X-Request-ID`/`Content-Length`/`Connection`; there is no
@@ -148,7 +155,18 @@ branch strategy, so a plain `run` (no strategy) and both `serve` and
 then accept absolute paths and follow symlinks with no restriction.
 **Fix:** default to a root; make rootless mode a loud, explicit opt-in.
 
-### H5 — Statically-vendored C libraries can ship CVEs no Rust tool flags
+### H5 — Statically-vendored C libraries can ship CVEs no Rust tool flags  ✅ MITIGATED
+
+> **Status: CI job added on this branch** (`.github/workflows/dependency-scan.yml`):
+> `osv-scanner` on `Cargo.lock` (fails on Rust-crate advisories) + best-effort
+> OSV queries of the bundled libcurl 8.20.0 / OpenSSL 3.6.2 / zlib 1.3.2,
+> surfaced in the job summary, on PR / push / weekly cron. **Caveat:** OSV
+> often records C-library CVEs as `GIT` commit ranges with an empty package
+> field, which a `pkg:generic/<name>`+version query cannot match — so a
+> `none` result means "nothing flagged by the version query", not "zero
+> CVEs". The job states this and points to upstream feeds for a definitive
+> check. Authoritative C-lib matching would need commit-resolved OSV queries.
+
 
 The build statically links bundled **libcurl 8.20.0-DEV, OpenSSL 3.6.2,
 zlib 1.3.2** (`vendor/curl-sys/curl/include/curl/curlver.h`,
@@ -164,7 +182,13 @@ upstream security feeds on every build.
 
 ## Medium
 
-### M1 — `openai` curl handle skips `curl_global_init`
+### M1 — `openai` curl handle skips `curl_global_init`  ✅ FIXED
+
+> **Status: fixed on this branch.** `curl_global_init_once()` (a `Once`-guarded
+> `curl_global_init(CURL_GLOBAL_DEFAULT)`) added to `openai/src/http.rs` and
+> called before `curl_easy_init` in `run_easy`, mirroring the anthropic/mcp
+> clients.
+
 
 `openai/src/http.rs` `run_easy` calls `curl_easy_init()` directly, unlike
 its `anthropic` and `mcp` siblings which gate every init behind a
@@ -190,11 +214,14 @@ is safer (`O_NOFOLLOW|O_EXCL|O_CREAT` tmp + rename).
 
 ## Low
 
-- **L1 — Duplicate `Content-Length` accepted (last-wins).**
-  `server/src/lib.rs:415-420` overwrites rather than rejecting a second
+- **L1 — Duplicate `Content-Length` accepted (last-wins).**  ✅ **FIXED**
+  `server/src/lib.rs` overwrote rather than rejecting a second
   `Content-Length`. Harmless against this single-component server (it
   reads exactly N bytes), but a request-smuggling primitive if it sits
-  behind/in front of another proxy. Reject the second header with 400.
+  behind/in front of another proxy. Now rejected with 400. *Correction to
+  the original note:* `usize::parse` does **not** reject a leading `+`
+  (`"+5".parse::<usize>()` == `Ok(5)`), so a digits-only guard was added
+  to make non-numeric / sign-prefixed lengths 400 as intended.
 - **L2 — Hard-link defense is best-effort and racy.** `fstools` checks
   `nlink > 1` before writing, but `atomic_write` makes a fresh inode and
   renames over the dest, so the original hard-linked inode is untouched
@@ -207,11 +234,15 @@ is safer (`O_NOFOLLOW|O_EXCL|O_CREAT` tmp + rename).
   the clear. Inputs are operator-controlled (low risk). Warn on `http://`
   base URLs with a real key; constrain redirect protocols / drop auth on
   cross-host redirect.
-- **L4 — `git` ref operands lack a `--` separator.** `git/src/lib.rs`
-  passes args as separate argv (no shell injection — good), but branch/ref
-  names are not preceded by `--`, so a ref like `--upload-pack=…` could be
-  parsed as a git flag where the name is externally influenced. Add `--`
-  before ref/path operands and validate names with `git check-ref-format`.
+- **L4 — `git` ref operands lack a `--` separator.**  ✅ **FIXED**
+  `git/src/lib.rs` passes args as separate argv (no shell injection — good),
+  but branch/ref names were not preceded by `--`, so a ref like
+  `--upload-pack=…` could be parsed as a git flag where the name is
+  externally influenced. `--` now separates ref/path operands at every
+  injectable call site, and a `valid_ref_name` validator (a `git
+  check-ref-format` subset) rejects hostile names before any git process
+  runs. (`checkout <target>` keeps validation instead of `--`, since `git
+  checkout -- <name>` reinterprets the name as a pathspec.)
 
 ---
 
@@ -262,10 +293,14 @@ parts of the package's safety story:
    users from trusting a boundary that isn't there.
 2. ~~**H1 — add JSON recursion depth caps**~~ ✅ **done** (depth cap 128 +
    regression tests in both parsers).
-3. **H2 — bind `serve` to loopback + require a token.**
-4. **C1/C2/H3/H4 — decide the real isolation story**: a genuine OS
-   sandbox + allowlist if untrusted models are in scope, or an explicit
-   "this runs with full host privileges; do not expose it to untrusted
-   input" posture if not.
-5. **H5 — add `osv-scanner` to CI** for the bundled C libraries.
-6. Clean up M1, M2, and the Lows as hardening.
+3. ~~**H2 — bind `serve` to loopback + require a token.**~~ ✅ **done.**
+4. **C1/C2/H3/H4 — decide the real isolation story** *(still open — needs a
+   threat-model decision)*: a genuine OS sandbox + allowlist if untrusted
+   models are in scope, or an explicit "this runs with full host
+   privileges; do not expose it to untrusted input" posture if not.
+5. ~~**H5 — add `osv-scanner` to CI**~~ ✅ **done** (with the C-lib
+   coverage caveat noted above).
+6. Hardening: ✅ M1 (curl init), ✅ L1 (Content-Length), ✅ L4 (git refs)
+   done. Still open: **M2** (fstools intermediate-component TOCTOU — an
+   `openat` dir-fd walk), **L2** (hard-link wording), **L3** (auth over
+   plaintext/redirect).

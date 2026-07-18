@@ -23,6 +23,8 @@
 //!                         (defaults to current dir)
 //!   SESSIONS_DIR          enable file-backed session persistence at this dir
 //!                         (or pass --sessions DIR)
+//!   AGENT_API_TOKEN       [serve] bearer token required on POST /agents/*
+//!                         (or pass --token); mandatory for non-loopback binds
 
 mod doctor;
 
@@ -107,7 +109,7 @@ fn usage_and_exit(code: u8) -> ExitCode {
         agent run [opts] <prompt>          one-shot prompt; streams response to stdout\n    \
           example: agent run \"summarize README.md\"\n  \
         agent serve [opts]                 long-running HTTP/1.1 + SSE server\n    \
-          example: agent serve --addr 0.0.0.0:3583\n  \
+          example: agent serve --addr 127.0.0.1:3583\n  \
         agent mcp-serve [opts]             speak MCP over stdio\n    \
           example: agent mcp-serve\n  \
         agent doctor [--mcp 'CMD ARGS']    smoke-check config + network\n    \
@@ -125,7 +127,8 @@ fn usage_and_exit(code: u8) -> ExitCode {
         --branch-strategy STRATEGY   [run] head | merge-to-head | branch:NAME\n  \
         --mock                       [run] stub model with a canned response; no API key required\n  \
         --mock-script PATH           [run] load scripted turns from a JSON file (implies --mock)\n  \
-        --addr HOST:PORT             [serve] bind address (default 0.0.0.0:3583)\n\n\
+        --addr HOST:PORT             [serve] bind address (default 127.0.0.1:3583)\n  \
+        --token TOKEN                [serve] require Authorization: Bearer TOKEN (or AGENT_API_TOKEN)\n\n\
         Run `agent <subcommand> --help` for subcommand-specific help.";
     eprintln!("{m}");
     ExitCode::from(code)
@@ -180,10 +183,19 @@ fn print_serve_help() {
     let m = "agent serve \u{2014} long-running HTTP/1.1 + SSE server.\n\n\
         Each POST /agents/chat/<id> opens a Session per id (in-memory) and\n\
         streams model events back as SSE frames.\n\n\
+        SECURITY: the endpoint drives a full agent run with shell-capable\n\
+        tools and spends on your provider key. It binds to loopback by\n\
+        default. Binding off-loopback (e.g. 0.0.0.0) REQUIRES a token: with\n\
+        no token set, `agent serve` refuses to start on a non-loopback\n\
+        address. When a token is set, /agents/* requires\n\
+        `Authorization: Bearer <TOKEN>`; /healthz and /readyz stay open.\n\n\
         usage:\n  \
         agent serve [opts]\n\n\
         flags:\n  \
-        --addr HOST:PORT             bind address (default 0.0.0.0:3583)\n  \
+        --addr HOST:PORT             bind address (default 127.0.0.1:3583)\n  \
+        --token TOKEN                require Authorization: Bearer TOKEN on /agents/*\n                               \
+                              (overrides AGENT_API_TOKEN). Mandatory when --addr\n                               \
+                              is not loopback.\n  \
         --openai                     use OpenAI-compatible provider (default: Anthropic)\n  \
         --model NAME                 model id\n  \
         --sessions DIR               persist message history to DIR\n  \
@@ -191,11 +203,13 @@ fn print_serve_help() {
         --runlog DIR                 tee every StreamEvent to <DIR>/<request_id>.jsonl\n  \
         --metrics HOST:PORT          send DogStatsD metrics here (overrides DOGSTATSD_ADDR)\n\n\
         examples:\n  \
-        agent serve\n  \
-        agent serve --addr 127.0.0.1:8080\n  \
+        agent serve                                   # loopback, no auth (local dev)\n  \
+        agent serve --addr 0.0.0.0:3583 --token s3cret # exposed, token required\n  \
+        AGENT_API_TOKEN=s3cret agent serve --addr 0.0.0.0:3583\n  \
         agent serve --openai --model gpt-4o-mini --runlog ./logs\n  \
         agent serve --metrics 127.0.0.1:8125\n\n\
         env:\n  \
+        AGENT_API_TOKEN             bearer token for /agents/* (lower priority than --token)\n  \
         ANTHROPIC_API_KEY            required for the default Anthropic provider\n  \
         OPENAI_API_KEY               required with --openai\n  \
         OPENAI_BASE_URL              override OpenAI base URL\n  \
@@ -954,13 +968,33 @@ fn render_skill(name: &str, args: &HashMap<String, String>) -> Result<String, St
     skill.render(&args_ref).map_err(|e| format!("{e:?}"))
 }
 
+/// Best-effort classification of a bind address as loopback-only. Resolves
+/// the host and returns `true` only when EVERY resolved socket address is a
+/// loopback address (127.0.0.0/8 or ::1). Anything that fails to resolve,
+/// resolves to nothing, or resolves to a non-loopback address is treated as
+/// non-loopback — the safe default, since it forces the token requirement.
+fn addr_is_loopback(addr: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    match addr.to_socket_addrs() {
+        Ok(iter) => {
+            let addrs: Vec<std::net::SocketAddr> = iter.collect();
+            !addrs.is_empty() && addrs.iter().all(|a| a.ip().is_loopback())
+        }
+        Err(_) => false,
+    }
+}
+
 fn serve_cmd(mut args: Vec<String>) -> ExitCode {
     if wants_help(&args) {
         print_serve_help();
         return ExitCode::SUCCESS;
     }
     let common = parse_common(&mut args);
-    let mut addr: String = "0.0.0.0:3583".into();
+    // Default to loopback: `agent serve` drives a full agent run with
+    // shell-capable tools, so it must not be reachable off-host unless the
+    // operator opts in *and* sets a token (enforced below).
+    let mut addr: String = "127.0.0.1:3583".into();
+    let mut token_flag: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -970,12 +1004,49 @@ fn serve_cmd(mut args: Vec<String>) -> ExitCode {
                     addr = args.remove(i);
                 }
             }
+            "--token" => {
+                args.remove(i);
+                if i < args.len() {
+                    token_flag = Some(args.remove(i));
+                }
+            }
             _ => i += 1,
         }
     }
     if !args.is_empty() {
         eprintln!("unexpected args: {args:?}");
         return usage_and_exit(2);
+    }
+
+    // Resolve the bearer token: `--token` wins over `AGENT_API_TOKEN`; an
+    // empty env value counts as unset so `AGENT_API_TOKEN=` can't
+    // accidentally "enable" auth with a blank secret.
+    let token =
+        token_flag.or_else(|| std::env::var("AGENT_API_TOKEN").ok()).filter(|t| !t.is_empty());
+
+    // Safety gate. Off-loopback with no token would expose an
+    // unauthenticated, command-capable endpoint on the network — refuse.
+    let loopback = addr_is_loopback(&addr);
+    if token.is_none() {
+        if !loopback {
+            eprintln!(
+                "error: refusing to start — --addr {addr} is not loopback and no API token is set.\n\n\
+                `agent serve` exposes POST /agents/chat/<id>, which drives a full agent run with\n\
+                shell-capable tools and spends on your provider key. Binding off-loopback without\n\
+                authentication lets anyone who can reach the port execute commands as you.\n\n\
+                Set a bearer token (clients then send `Authorization: Bearer <TOKEN>`):\n    \
+                export AGENT_API_TOKEN=$(head -c 32 /dev/urandom | base64)   # or pass --token <TOKEN>\n\n\
+                Or bind to loopback only (the default):\n    \
+                agent serve --addr 127.0.0.1:3583"
+            );
+            return ExitCode::from(2);
+        }
+        eprintln!(
+            "notice: serving on loopback {addr} without authentication; set --token or \
+            AGENT_API_TOKEN to require a bearer token on /agents/*."
+        );
+    } else {
+        eprintln!("notice: bearer-token auth enabled on /agents/* (health checks stay open).");
     }
 
     let model = match build_model(&common) {
@@ -1023,6 +1094,9 @@ fn serve_cmd(mut args: Vec<String>) -> ExitCode {
             metrics: metrics_client,
         }),
     );
+    // Enforce the bearer token (if any) on `/agents/*`. `None` leaves the
+    // endpoints open — only reachable on loopback given the gate above.
+    srv.set_auth_token(token);
 
     eprintln!("serving on {addr}");
     // Bind first so binding errors don't get mixed up with shutdown state.

@@ -135,9 +135,35 @@ cargo run --bin agent -- run --compact-budget 50000 "long conversation continues
 cargo run --bin agent -- mcp-serve
 
 # HTTP server: POST /agents/chat/<id>, SSE response (now actually streams),
-# sessions persist by id
-cargo run --bin agent -- serve --addr 0.0.0.0:3583 --sessions ./.sessions
+# sessions persist by id. Binds to loopback by default.
+cargo run --bin agent -- serve --addr 127.0.0.1:3583 --sessions ./.sessions
 ```
+
+### `agent serve` network exposure & auth
+
+`agent serve` exposes `POST /agents/chat/<id>`, which drives a full agent
+run with the default (shell-capable) toolset and spends on your provider
+key. Treat the port as privileged:
+
+- **Default bind is `127.0.0.1:3583`** (loopback only). Local dev needs no
+  token; the server prints a one-line notice that it is unauthenticated.
+- **A bearer token** is read from `--token <TOKEN>` or the
+  `AGENT_API_TOKEN` env var (the flag wins). When set, every
+  `POST /agents/*` request must send `Authorization: Bearer <TOKEN>`;
+  a missing or wrong token gets `401`. The token compare is constant-time.
+- **Binding off-loopback requires a token.** If `--addr` is not a loopback
+  address (e.g. `0.0.0.0:3583`) and no token is set, `agent serve` refuses
+  to start and explains how to set one. This is the intended way to expose
+  the server:
+
+  ```bash
+  export AGENT_API_TOKEN=$(head -c 32 /dev/urandom | base64)
+  agent serve --addr 0.0.0.0:3583
+  # clients: curl -H "Authorization: Bearer $AGENT_API_TOKEN" ...
+  ```
+
+- **Health endpoints** `/healthz` and `/readyz` are always unauthenticated
+  so liveness/readiness probes work regardless of token config.
 
 ## Measured numbers
 

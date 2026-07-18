@@ -108,15 +108,29 @@ impl std::error::Error for HandlerError {}
 
 pub struct Server {
     handlers: HashMap<String, Box<dyn AgentHandler>>,
+    /// Optional bearer token guarding the `/agents/*` endpoints. `None`
+    /// means no authentication (the default, and what the in-process tests
+    /// rely on); `Some(token)` requires `Authorization: Bearer <token>` on
+    /// every agent request and rejects mismatches with 401. Health/ops
+    /// endpoints (`/healthz`, `/readyz`) are never gated.
+    auth_token: Option<String>,
 }
 
 impl Server {
     pub fn new() -> Self {
-        Self { handlers: HashMap::new() }
+        Self { handlers: HashMap::new(), auth_token: None }
     }
 
     pub fn register(&mut self, name: impl Into<String>, handler: Box<dyn AgentHandler>) {
         self.handlers.insert(name.into(), handler);
+    }
+
+    /// Configure (or clear) the bearer token that guards `/agents/*`.
+    /// `Some(token)` turns on `Authorization: Bearer <token>` enforcement;
+    /// `None` leaves the agent endpoints open. Health endpoints are always
+    /// reachable regardless of this setting.
+    pub fn set_auth_token(&mut self, token: Option<String>) {
+        self.auth_token = token;
     }
 
     /// Bind `addr` and serve with [`ServerConfig::default`].
@@ -300,6 +314,20 @@ impl Server {
             );
         };
 
+        // Bearer-token gate. When a token is configured, every `/agents/*`
+        // request must carry a matching `Authorization: Bearer <token>`;
+        // the compare is constant-time so the token can't be recovered by
+        // timing. Health/ops endpoints above are intentionally exempt.
+        // A `None` token leaves the endpoints open (local-dev default).
+        if let Some(expected) = &self.auth_token
+            && !authorized(req.authorization.as_deref(), expected)
+        {
+            return (
+                ResponseKind::Buffered,
+                write_simple(stream, 401, "Unauthorized", Some(&request_id)),
+            );
+        }
+
         // Commit SSE headers up front. Once they're on the wire any handler
         // error has to be surfaced inside the stream as an `error` event;
         // we can't retroactively change the status. The `X-Request-ID` echo
@@ -362,6 +390,9 @@ struct Request {
     /// Verbatim value of an inbound `X-Request-ID` header, if any. The
     /// dispatcher falls back to a synthetic id when this is `None`.
     request_id: Option<String>,
+    /// Verbatim value of an inbound `Authorization` header, if any. The
+    /// dispatcher uses it to enforce a configured bearer token.
+    authorization: Option<String>,
 }
 
 #[derive(Debug)]
@@ -398,6 +429,7 @@ fn parse_request<R: BufRead>(reader: &mut R) -> Result<Request, ParseError> {
     let mut content_length: Option<usize> = None;
     let mut connection_close = version == "HTTP/1.0";
     let mut request_id: Option<String> = None;
+    let mut authorization: Option<String> = None;
     let mut header_count = 0usize;
     loop {
         let line = read_line(reader, false)?.ok_or(ParseError::Malformed)?;
@@ -413,6 +445,19 @@ fn parse_request<R: BufRead>(reader: &mut R) -> Result<Request, ParseError> {
         let value = value.trim();
         match name.as_str() {
             "content-length" => {
+                // A second Content-Length is a request-smuggling primitive
+                // once a proxy sits in front of us — reject rather than
+                // last-wins overwrite.
+                if content_length.is_some() {
+                    return Err(ParseError::Malformed);
+                }
+                // `usize::parse` accepts a leading `+` (e.g. "+5"), so a
+                // digits-only guard is required to make non-numeric and
+                // `+`/`-`-prefixed values a clean 400 rather than framing a
+                // body off a surprising length. `value` is already trimmed.
+                if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(ParseError::Malformed);
+                }
                 let n: usize = value.parse().map_err(|_| ParseError::Malformed)?;
                 if n > MAX_BODY {
                     return Err(ParseError::TooLarge);
@@ -446,6 +491,13 @@ fn parse_request<R: BufRead>(reader: &mut R) -> Result<Request, ParseError> {
                     request_id = Some(value.to_string());
                 }
             }
+            "authorization" => {
+                // Captured verbatim; the dispatcher validates it against the
+                // configured bearer token. Last value wins if repeated —
+                // harmless since a wrong value still fails the constant-time
+                // compare.
+                authorization = Some(value.to_string());
+            }
             _ => {}
         }
     }
@@ -459,7 +511,7 @@ fn parse_request<R: BufRead>(reader: &mut R) -> Result<Request, ParseError> {
         }
     };
 
-    Ok(Request { method, path, body, connection_close, request_id })
+    Ok(Request { method, path, body, connection_close, request_id, authorization })
 }
 
 /// Read one CRLF-terminated line. With `allow_idle = true` (used only for
@@ -517,6 +569,38 @@ fn read_exact_mapped<R: BufRead>(reader: &mut R, buf: &mut [u8]) -> Result<(), P
 
 fn is_timeout(e: &io::Error) -> bool {
     matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+}
+
+/// Validate an inbound `Authorization` header against the configured
+/// bearer token. Accepts exactly `Bearer <token>` — the scheme is matched
+/// case-insensitively per RFC 7235, the token compared in constant time.
+/// The scheme/format checks short-circuit (they reveal nothing secret);
+/// only the token comparison must be timing-safe.
+fn authorized(header: Option<&str>, expected: &str) -> bool {
+    let Some(h) = header else { return false };
+    let Some((scheme, token)) = h.trim().split_once(' ') else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return false;
+    }
+    constant_time_eq(token.trim().as_bytes(), expected.as_bytes())
+}
+
+/// Constant-time byte-slice equality. Unlike `==` it never early-exits on
+/// the first differing byte, so a network attacker can't recover the token
+/// one byte at a time by measuring response latency. A length mismatch is
+/// folded into the accumulator (so unequal lengths always fail) and the
+/// scan always runs over the longer of the two inputs.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff: u8 = if a.len() == b.len() { 0 } else { 1 };
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn write_simple(
@@ -1282,5 +1366,118 @@ mod tests {
         let a = generate_request_id();
         let b = generate_request_id();
         assert_ne!(a, b, "generator collided immediately: {a} == {b}");
+    }
+
+    // Bearer-token auth ------------------------------------------------------
+
+    /// Spawn a server with the same handler set as `spawn_server` but with a
+    /// configured bearer token, so `/agents/*` requests must authenticate.
+    fn spawn_server_with_token(token: &str) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = Server::new();
+        server.register("echo", Box::new(EchoAgent));
+        server.set_auth_token(Some(token.to_string()));
+        let handle = thread::spawn(move || {
+            let _ = server.serve_listener_with(listener, ServerConfig::default());
+        });
+        (addr, handle)
+    }
+
+    /// A token is configured but the request omits `Authorization` → 401.
+    #[test]
+    fn missing_bearer_token_returns_401() {
+        let (addr, _h) = spawn_server_with_token("s3cret");
+        let req = b"POST /agents/echo/x HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+        let resp = send(addr, req);
+        assert!(resp.starts_with(b"HTTP/1.1 401"), "got: {:?}", String::from_utf8_lossy(&resp));
+    }
+
+    /// A token is configured but the request sends the wrong one → 401.
+    #[test]
+    fn wrong_bearer_token_returns_401() {
+        let (addr, _h) = spawn_server_with_token("s3cret");
+        let req =
+            b"POST /agents/echo/x HTTP/1.1\r\nAuthorization: Bearer nope\r\nContent-Length: 0\r\n\r\n";
+        let resp = send(addr, req);
+        assert!(resp.starts_with(b"HTTP/1.1 401"), "got: {:?}", String::from_utf8_lossy(&resp));
+    }
+
+    /// The correct bearer token authorizes the request and the handler runs.
+    #[test]
+    fn correct_bearer_token_authorizes() {
+        let (addr, _h) = spawn_server_with_token("s3cret");
+        let req = b"POST /agents/echo/abc HTTP/1.1\r\n\
+                    Authorization: Bearer s3cret\r\n\
+                    Content-Length: 5\r\n\r\nhello";
+        let resp = send(addr, req);
+        let (head, body) = split_headers_body(&resp);
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "head: {head}");
+        let body = String::from_utf8(body).unwrap();
+        assert!(body.contains("event: start\ndata: abc\n\n"), "body: {body:?}");
+        assert!(body.contains("data: hello\n\n"), "body: {body:?}");
+    }
+
+    /// Health endpoints stay open even when a token is configured.
+    #[test]
+    fn healthz_open_even_with_token_configured() {
+        let (addr, _h) = spawn_server_with_token("s3cret");
+        let req = b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n";
+        let resp = send(addr, req);
+        assert!(resp.starts_with(b"HTTP/1.1 200"));
+        assert!(resp.ends_with(b"ok\n"));
+    }
+
+    /// With no token configured (default), `/agents/*` needs no auth — this
+    /// is the backward-compatible behaviour the other tests rely on.
+    #[test]
+    fn no_token_configured_leaves_endpoints_open() {
+        let (addr, _h) = spawn_server();
+        let req = b"POST /agents/echo/abc HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+        let resp = send(addr, req);
+        assert!(resp.starts_with(b"HTTP/1.1 200"));
+    }
+
+    #[test]
+    fn authorized_requires_exact_bearer_token() {
+        assert!(authorized(Some("Bearer s3cret"), "s3cret"));
+        // Scheme is case-insensitive.
+        assert!(authorized(Some("bearer s3cret"), "s3cret"));
+        assert!(!authorized(Some("Bearer wrong"), "s3cret"));
+        // Missing scheme, empty, and absent headers all fail closed.
+        assert!(!authorized(Some("s3cret"), "s3cret"));
+        assert!(!authorized(Some(""), "s3cret"));
+        assert!(!authorized(None, "s3cret"));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_equality_semantics() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"", b"x"));
+    }
+
+    // Duplicate Content-Length (L1) -----------------------------------------
+
+    /// A second `Content-Length` header is rejected with 400 rather than
+    /// silently overwriting (request-smuggling hardening).
+    #[test]
+    fn duplicate_content_length_returns_400() {
+        let (addr, _h) = spawn_server();
+        let req = b"POST /agents/echo/x HTTP/1.1\r\n\
+                    Content-Length: 0\r\nContent-Length: 5\r\n\r\nhello";
+        let resp = send(addr, req);
+        assert!(resp.starts_with(b"HTTP/1.1 400"), "got: {:?}", String::from_utf8_lossy(&resp));
+    }
+
+    /// A non-numeric `Content-Length` is a clean 400, not a panic.
+    #[test]
+    fn non_numeric_content_length_returns_400() {
+        let (addr, _h) = spawn_server();
+        let req = b"POST /agents/echo/x HTTP/1.1\r\nContent-Length: +5\r\n\r\nhello";
+        let resp = send(addr, req);
+        assert!(resp.starts_with(b"HTTP/1.1 400"), "got: {:?}", String::from_utf8_lossy(&resp));
     }
 }

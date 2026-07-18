@@ -115,12 +115,18 @@ fn ensure_repo(repo_root: &Path) -> Result<(), GitError> {
 }
 
 /// Current branch name (`git symbolic-ref --short HEAD`). Errors on detached HEAD.
+///
+/// The result is a derived name that later flows into a `checkout` target, so it
+/// is run through [`valid_ref_name`] — a real checked-out branch always passes.
 fn current_branch(repo_root: &Path) -> Result<String, GitError> {
-    git_cmd(["symbolic-ref", "--short", "HEAD"], repo_root).map(stdout_trimmed).map_err(|e| match e
-    {
-        GitError::Git { .. } => GitError::Other("detached HEAD: no target branch".into()),
-        other => other,
-    })
+    let name = git_cmd(["symbolic-ref", "--short", "HEAD"], repo_root)
+        .map(stdout_trimmed)
+        .map_err(|e| match e {
+            GitError::Git { .. } => GitError::Other("detached HEAD: no target branch".into()),
+            other => other,
+        })?;
+    valid_ref_name(&name)?;
+    Ok(name)
 }
 
 fn is_dirty(repo_root: &Path) -> Result<bool, GitError> {
@@ -135,6 +141,46 @@ fn branch_exists(repo_root: &Path, name: &str) -> Result<bool, GitError> {
         .current_dir(repo_root)
         .output()?;
     Ok(out.status.success())
+}
+
+/// Conservative branch/ref name check — a subset of `git check-ref-format`.
+///
+/// Defense in depth alongside the `--` separators at the call sites: even where
+/// git would parse a `-`-leading operand as a value, we refuse names that could
+/// be misparsed as an option or that aren't a well-formed single ref. Rejects
+/// names that are empty, begin with `-`, contain whitespace or control chars,
+/// contain `..`, begin/end with `/`, contain any of `~ ^ : ? * [ \` or the
+/// sequence `@{`, or end with `.lock`. Legitimate names (e.g. `feature/foo`,
+/// the internally generated `agent-…` names) pass unchanged.
+fn valid_ref_name(name: &str) -> Result<(), GitError> {
+    let reject = |why: &str| Err(GitError::Other(format!("invalid ref name {name:?}: {why}")));
+    if name.is_empty() {
+        return reject("empty");
+    }
+    if name.starts_with('-') {
+        return reject("begins with '-'");
+    }
+    if name.starts_with('/') || name.ends_with('/') {
+        return reject("begins or ends with '/'");
+    }
+    if name.ends_with(".lock") {
+        return reject("ends with '.lock'");
+    }
+    if name.contains("..") {
+        return reject("contains '..'");
+    }
+    if name.contains("@{") {
+        return reject("contains '@{'");
+    }
+    for c in name.chars() {
+        if c.is_whitespace() || c.is_control() {
+            return reject("contains whitespace or a control character");
+        }
+        if matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\') {
+            return reject("contains a forbidden character (~^:?*[\\)");
+        }
+    }
+    Ok(())
 }
 
 fn worktree_root(repo_root: &Path) -> PathBuf {
@@ -231,6 +277,9 @@ impl BranchStrategy for MergeToHeadStrategy {
                 OsStr::new("add"),
                 OsStr::new("-b"),
                 OsStr::new(&branch),
+                // `--` ends option parsing: the path and commit-ish that follow
+                // can't be misread as flags even if they began with `-`.
+                OsStr::new("--"),
                 wt_path.as_os_str(),
                 OsStr::new("HEAD"),
             ],
@@ -248,6 +297,11 @@ impl BranchStrategy for MergeToHeadStrategy {
 
         match status {
             AgentStatus::Success => {
+                // `git checkout <branch>` gives `--` pathspec semantics, so a
+                // leading-`-` operand can't be neutralised with a separator here;
+                // validate the target name instead (belt-and-braces — it was
+                // already validated when captured via `current_branch`).
+                valid_ref_name(&target)?;
                 git_cmd(["checkout", &target], &repo_root)?;
                 git_cmd(
                     [
@@ -255,6 +309,8 @@ impl BranchStrategy for MergeToHeadStrategy {
                         "--no-ff",
                         "-m",
                         &format!("Merge {} into {}", ws.source_branch, target),
+                        // `--` ends options: the branch operand can't be a flag.
+                        "--",
                         &ws.source_branch,
                     ],
                     &repo_root,
@@ -264,12 +320,13 @@ impl BranchStrategy for MergeToHeadStrategy {
                         OsStr::new("worktree"),
                         OsStr::new("remove"),
                         OsStr::new("--force"),
+                        OsStr::new("--"),
                         ws.path.as_os_str(),
                     ],
                     &repo_root,
                 )?;
                 // Best-effort branch cleanup; commits are reachable from target.
-                let _ = git_cmd(["branch", "-D", &ws.source_branch], &repo_root);
+                let _ = git_cmd(["branch", "-D", "--", &ws.source_branch], &repo_root);
                 Ok(())
             }
             AgentStatus::Failure(reason) => {
@@ -304,6 +361,10 @@ impl Branch {
 
 impl BranchStrategy for Branch {
     fn prepare(&self, repo_root: &Path) -> Result<Workspace, GitError> {
+        // Reject a hostile branch name before we shell out to git at all — the
+        // name reaches `worktree add -B <name> … <start_point>`, and when the
+        // branch already exists the start-point operand *is* the name.
+        valid_ref_name(&self.name)?;
         ensure_repo(repo_root)?;
         let wt_dir = worktree_root(repo_root);
         std::fs::create_dir_all(&wt_dir)?;
@@ -322,6 +383,8 @@ impl BranchStrategy for Branch {
                 OsStr::new("add"),
                 OsStr::new("-B"),
                 OsStr::new(&self.name),
+                // `--` ends option parsing for the path and start-point operands.
+                OsStr::new("--"),
                 wt_path.as_os_str(),
                 OsStr::new(&start_point),
             ],
@@ -339,6 +402,7 @@ impl BranchStrategy for Branch {
                         OsStr::new("worktree"),
                         OsStr::new("remove"),
                         OsStr::new("--force"),
+                        OsStr::new("--"),
                         ws.path.as_os_str(),
                     ],
                     &repo_root,
@@ -641,5 +705,77 @@ mod tests {
         assert_eq!(unix_to_ymdhms(946_684_800), (2000, 1, 1, 0, 0, 0));
         // 2024-02-29 (leap day) 12:24:56 UTC
         assert_eq!(unix_to_ymdhms(1_709_209_496), (2024, 2, 29, 12, 24, 56));
+    }
+
+    // ---- ref-name validation (L4) ----
+
+    #[test]
+    fn valid_ref_name_rejects_hostile() {
+        // Option-injection vectors and other malformed names must be rejected.
+        for bad in [
+            "",                // empty
+            "--upload-pack=x", // option injection
+            "-X",              // leading dash
+            "-",               // just a dash
+            " ",               // whitespace
+            "a b",             // embedded space
+            "a\tb",            // control/whitespace
+            "a\nb",            // control/whitespace
+            "a..b",            // double-dot range
+            "/leading",        // leading slash
+            "trailing/",       // trailing slash
+            "foo.lock",        // .lock suffix
+            "ref@{0}",         // @{ reflog syntax
+            "a~1",             // tilde
+            "a^",              // caret
+            "a:b",             // colon
+            "a?b",             // glob ?
+            "a*b",             // glob *
+            "a[b",             // glob [
+            "a\\b",            // backslash
+        ] {
+            assert!(valid_ref_name(bad).is_err(), "expected {bad:?} to be rejected",);
+            match valid_ref_name(bad) {
+                Err(GitError::Other(m)) => assert!(m.contains("invalid ref name"), "msg: {m}"),
+                other => panic!("expected GitError::Other for {bad:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn valid_ref_name_accepts_legit() {
+        for good in ["main", "feature/foo", "feature/x", "agent-work", "agent", "v1.2.3", "a.b"] {
+            assert!(valid_ref_name(good).is_ok(), "expected {good:?} to be accepted");
+        }
+        // The internally generated names must always pass.
+        let generated = gen_branch_name();
+        assert!(valid_ref_name(&generated).is_ok(), "generated name {generated:?} was rejected",);
+    }
+
+    #[test]
+    fn branch_hostile_name_errors_before_shelling_out() {
+        // Validation is the first thing `prepare` does, ahead of `ensure_repo`,
+        // so a hostile name fails with the validation error even when pointed at
+        // a path that is not a repo — proving no git invocation with the name
+        // ever runs.
+        let not_a_repo = std::env::temp_dir().join("moth-git-l4-nonexistent-xyzzy");
+        let _ = std::fs::remove_dir_all(&not_a_repo);
+        let err = Branch::new("--upload-pack=/tmp/x").prepare(&not_a_repo).unwrap_err();
+        match err {
+            GitError::Other(m) => assert!(m.contains("invalid ref name"), "msg: {m}"),
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn branch_hostile_name_errors_in_real_repo() {
+        // Same guarantee inside a real repo: no worktree is created for the name.
+        let r = TempRepo::new();
+        let err = Branch::new("-X").prepare(&r.path).unwrap_err();
+        assert!(matches!(err, GitError::Other(_)), "got {err:?}");
+        assert!(
+            !r.path.join(".moth/worktrees/-X").exists(),
+            "hostile name should not have produced a worktree",
+        );
     }
 }
